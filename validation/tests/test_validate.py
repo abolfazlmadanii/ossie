@@ -1625,3 +1625,115 @@ def test_superseded_ossie_sql_2026_dialect_entry_is_not_scope_checked() -> None:
     )
 
     assert _VALIDATE.validate_metric_scoping(doc) == []
+
+
+# Direct tests for iter_expressions(), which validate_sql and
+# validate_metric_scoping both walk.
+
+
+def _iter(data: dict) -> list:
+    return list(_VALIDATE.iter_expressions(data))
+
+
+def _one_field(expression: dict) -> dict:
+    return {
+        "name": "m",
+        "datasets": [
+            {"name": "orders", "fields": [{"name": "amount", "expression": expression}]}
+        ],
+    }
+
+
+def test_iter_expressions_yields_top_level_sql_as_ossie_sql_2026() -> None:
+    [expr] = _iter(_one_field({"sql": "amount"}))
+
+    assert (expr.kind, expr.dataset_name, expr.name) == ("field", "orders", "amount")
+    assert (expr.dialect, expr.text, expr.superseded_by) == ("OSSIE_SQL_2026", "amount", None)
+    assert expr.field_names == frozenset({"amount"})
+
+
+def test_iter_expressions_yields_each_dialect_entry() -> None:
+    exprs = _iter(_one_field({"dialects": [
+        {"dialect": "SNOWFLAKE", "expression": "amount::number"},
+        {"dialect": "DATABRICKS", "expression": "CAST(amount AS DECIMAL)"},
+    ]}))
+
+    assert [(e.dialect, e.text) for e in exprs] == [
+        ("SNOWFLAKE", "amount::number"),
+        ("DATABRICKS", "CAST(amount AS DECIMAL)"),
+    ]
+    assert all(e.superseded_by is None for e in exprs)
+
+
+def test_iter_expressions_yields_sql_before_dialects_and_marks_superseded_entry() -> None:
+    exprs = _iter(_one_field({
+        "sql": "amount",
+        "dialects": [
+            {"dialect": "SNOWFLAKE", "expression": "amount::number"},
+            {"dialect": "OSSIE_SQL_2026", "expression": "amount + 0"},
+        ],
+    }))
+
+    assert [(e.dialect, e.text, e.superseded_by) for e in exprs] == [
+        ("OSSIE_SQL_2026", "amount", None),
+        ("SNOWFLAKE", "amount::number", None),
+        ("OSSIE_SQL_2026", "amount + 0", "amount"),
+    ]
+
+
+def test_iter_expressions_covers_dataset_and_model_metrics_in_order() -> None:
+    data = {
+        "name": "m",
+        "datasets": [{
+            "name": "orders",
+            "fields": [{"name": "Amount", "expression": {"sql": "amount"}}],
+            "metrics": [{"name": "total", "expression": {"sql": "SUM(amount)"}}],
+        }],
+        "metrics": [{"name": "avg_total", "expression": {"sql": "AVG(orders.amount)"}}],
+    }
+
+    exprs = _iter(data)
+
+    assert [(e.kind, e.dataset_name, e.name) for e in exprs] == [
+        ("field", "orders", "Amount"),
+        ("dataset_metric", "orders", "total"),
+        ("model_metric", "", "avg_total"),
+    ]
+    # Dataset members see the casefolded field names; model metrics see none.
+    assert exprs[1].field_names == frozenset({"amount"})
+    assert exprs[2].field_names == frozenset()
+
+
+def test_iter_expressions_yields_empty_text_and_skips_missing_expressions() -> None:
+    data = {
+        "name": "m",
+        "datasets": [{
+            "name": "orders",
+            "fields": [
+                {"name": "blank", "expression": {"sql": ""}},
+                {"name": "no_expression"},
+                {"name": "no_text", "expression": {"dialects": [{"dialect": "SNOWFLAKE"}]}},
+            ],
+        }],
+    }
+
+    assert [(e.name, e.dialect, e.text) for e in _iter(data)] == [
+        ("blank", "OSSIE_SQL_2026", ""),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "dataset_name", "expected"),
+    [
+        ("field", "orders", "Field 'orders.x' in model 'm' (SNOWFLAKE)"),
+        ("dataset_metric", "orders", "Metric 'orders.x' in model 'm' (SNOWFLAKE)"),
+        ("model_metric", "", "Metric 'x' in model 'm' (SNOWFLAKE)"),
+    ],
+)
+def test_expression_context_names_the_declaring_element(kind, dataset_name, expected) -> None:
+    expr = _VALIDATE.Expression(
+        kind=kind, dataset_name=dataset_name, name="x", dialect="SNOWFLAKE",
+        text="x", field_names=frozenset(),
+    )
+
+    assert expr.context("m") == expected
